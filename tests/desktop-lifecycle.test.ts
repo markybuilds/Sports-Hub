@@ -1,336 +1,306 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
-import { createContext, runInContext, runInNewContext } from 'node:vm';
+import { runInNewContext } from 'node:vm';
 
-const desktopRequire = createRequire(new URL('../desktop/main.cjs', import.meta.url));
-const source = readFileSync(new URL('../desktop/main.cjs', import.meta.url), 'utf8');
+const require = createRequire(import.meta.url);
+const { DesktopNsisUpdater } = require('../desktop/nsis-updater.cjs');
+const settle = () => new Promise<void>(resolve => setImmediate(resolve));
 
-// Exercise the real main-process lifecycle without opening Electron or a server.
-function desktopHarness(fetcher: typeof fetch) {
-  const messages: unknown[] = [];
-  const channels: string[] = [];
-  const views: FakeView[] = [];
-  const windowState={visible:true,minimized:false,fullscreen:false};
-  const handlers=new Map<string,(event:unknown,value:unknown)=>unknown>();
-  const ipcMain=Object.assign(new EventEmitter(),{handle:(channel:string,handler:(event:unknown,value:unknown)=>unknown)=>{handlers.set(channel,handler);}});
-  const hostContents={mainFrame:{url:'http://127.0.0.1:51931/'},getURL:()=>hostContents.mainFrame.url,getZoomFactor:()=>1,send:(channel:string,value?:unknown)=>{channels.push(channel);messages.push(value);}};
-  class FakeContents extends EventEmitter {
+async function desktop(options: { stopFailures?: readonly string[]; observerStopGate?: Promise<void>;
+  downloadedUpdate?: boolean } = {}) {
+  const userData = mkdtempSync(path.join(tmpdir(), 'sunday-desktop-lifecycle-'));
+  const windows: FakeWindow[] = [];
+  const running = new Set(['server', 'sportsurge', 'observer', 'streameast']);
+  const stopAttempts: string[] = [];
+  let installPreparation: (() => Promise<void>) | undefined;
+  const updaters: FakeUpdater[] = [];
+  let exited = false;
+  let exitCode: number | undefined;
+
+  class FakeWindow extends EventEmitter {
+    visible = false;
     destroyed = false;
-    scripts: string[] = [];
-    media: {ready:number;time:number;paused:boolean;error?:boolean;ended?:boolean} | null = null;
-    audioMuted=true;
-    evaluate: ((script:string)=>unknown) | null = null;
+    minimized = false;
+    focused = false;
+    webContents = Object.assign(new EventEmitter(), {
+      mainFrame: { url: '' },
+      setWindowOpenHandler() {},
+      send() {},
+      executeJavaScript: async () => {},
+    });
+    constructor() { super(); windows.push(this); }
+    async loadURL(url: string) { this.webContents.mainFrame.url = url; }
+    setAppDetails() {}
+    show() { this.visible = true; }
+    hide() { this.visible = false; }
+    focus() { this.focused = true; }
+    restore() { this.minimized = false; }
+    isMinimized() { return this.minimized; }
     isDestroyed() { return this.destroyed; }
-    close() { this.destroyed = true; }
-    setAudioMuted(muted:boolean) {this.audioMuted=muted;}
-    setWindowOpenHandler() {}
-    async loadURL() {}
-    async executeJavaScript(script: string) { this.scripts.push(script);return this.evaluate?this.evaluate(script):script.includes('ready:v.readyState')?this.media:null; }
+    isFocused() { return this.focused; }
+    close() {
+      let prevented = false;
+      this.emit('close', { preventDefault() { prevented = true; } });
+      if (prevented) return;
+      this.destroyed = true;
+      this.visible = false;
+      this.emit('closed');
+    }
   }
-  class FakeView {
-    webContents = new FakeContents();
-    constructor() { views.push(this); }
-    setBackgroundColor() {}
-    setVisible() {}
-    setBounds() {}
-  }
+
   const app = Object.assign(new EventEmitter(), {
-    setName() {}, requestSingleInstanceLock: () => true,
-    whenReady: () => new Promise(() => {}), quit() {},
+    isPackaged: true,
+    setName() {},
+    setAppUserModelId() {},
+    getPath: () => userData,
+    getVersion: () => '1.0.10',
+    requestSingleInstanceLock: () => true,
+    whenReady: () => Promise.resolve(),
+    onQuit(handler: (code: number) => void) { app.on('quit', handler); },
+    quit() {
+      let prevented = false;
+      app.emit('before-quit', { preventDefault() { prevented = true; } });
+      if (prevented) return;
+      exited = true;
+      exitCode = 0;
+      app.emit('quit', 0);
+      app.emit('will-quit');
+    },
+    exit(code = 0) { exited = true; exitCode = code; app.emit('quit', code); },
   });
-  const context = createContext({
-    require: (name: string) => name === 'electron' ? { app, WebContentsView: FakeView,ipcMain } : desktopRequire(name),
-    __dirname: fileURLToPath(new URL('../desktop/', import.meta.url)),
-    process: { env: {} }, AbortController, AbortSignal, URL,
-    fetch: fetcher,
-    hostWindow: { isDestroyed: () => false, isVisible:()=>windowState.visible, isMinimized:()=>windowState.minimized,isFullScreen:()=>windowState.fullscreen,setFullScreen:(value:boolean)=>{windowState.fullscreen=value;},getContentSize:()=>[1200,800], contentView: { addChildView() {}, removeChildView() {} }, webContents:hostContents },
+  const service = (name: string) => ({
+    start: async () => 'http://127.0.0.1:4132',
+    beginStop() { stopAttempts.push('admission'); },
+    requestSweep() {},
+    async stop() {
+      stopAttempts.push(name);
+      if (name === 'observer') await options.observerStopGate;
+      if (options.stopFailures?.includes(name)) throw new Error(`${name} cleanup failed`);
+      running.delete(name);
+    },
   });
-  runInContext(source, context);
-  runInContext("win=hostWindow;origin='http://127.0.0.1:51931'", context);
-  return { run: (script: string) => runInContext(script, context), views, messages,windowState,channels,ipcMain,hostContents,invoke:(channel:string,event:unknown,value:unknown)=>handlers.get(channel)!(event,value) };
+  class FakeUpdater {
+    app = app;
+    autoInstallOnAppQuit = false;
+    quitHandlerAdded = false;
+    quitAndInstallCalled = false;
+    installAttempts = 0;
+    _logger = { error() {} };
+    constructor() { updaters.push(this); }
+    setFeedURL() {}
+    async install() { this.installAttempts++; return true; }
+    addQuitHandler() { DesktopNsisUpdater.prototype.addQuitHandler.call(this); }
+  }
+  const dependency = (name: string) => {
+    if (name === 'electron') return {
+      app, autoUpdater: new EventEmitter(), BrowserWindow: FakeWindow,
+      ipcMain: { handle() {} }, shell: { openExternal: async () => {} },
+      powerMonitor: new EventEmitter(), Notification: { isSupported: () => false },
+    };
+    if (name === './port.cjs') return { localServerPort: async () => 4132 };
+    if (name === './local-server.cjs') return { createLocalServer: () => service('server') };
+    if (name === './sportsurge-collector.cjs') return { createSportsurgeCollector: () => service('sportsurge') };
+    if (name === './sportsurge-observer.cjs') return { createSportsurgeObserver: () => service('observer') };
+    if (name === './streameast-collector.cjs') return { createStreameastCollector: () => service('streameast') };
+    if (name === './nsis-updater.cjs') return { DesktopNsisUpdater: FakeUpdater };
+    if (name === './update.cjs') return {
+      CH: { get: 'get', check: 'check', download: 'download', install: 'install', setSource: 'source', setPreferences: 'preferences' },
+      selectUpdateFeedUrl: () => 'https://updates.example.invalid/',
+      createUpdateService: ({ prepareInstall }: { prepareInstall: () => Promise<void> }) => {
+        installPreparation = prepareInstall;
+        return { start() { if (options.downloadedUpdate) updaters.at(-1)?.addQuitHandler(); }, stop() {},
+          invoke: () => () => {}, snapshot: () => ({ state: { kind: 'idle' } }) };
+      },
+    };
+    return require(name);
+  };
+  const source = readFileSync(path.resolve('desktop/main.cjs'), 'utf8');
+  const boot = runInNewContext(`(function(require, __dirname, process, fetch, AbortSignal, console) { ${source}\n})`, {
+    setImmediate, setTimeout, clearTimeout, setInterval, clearInterval, URL,
+  });
+  boot(dependency, path.resolve('desktop'), {
+    platform: 'win32', resourcesPath: userData,
+    execPath: 'C:\\Programs\\Sunday Room\\Sunday Room.exe', env: {},
+  }, async () => ({ ok: true }), AbortSignal, console);
+  await settle();
+  const window = windows[0];
+  assert.ok(window, 'the production entry point opened a desktop window');
+  assert.equal(window.visible, true);
+  return {
+    app, window, running, stopAttempts, hasExited: () => exited, exitCode: () => exitCode,
+    installAttempts: () => updaters.at(-1)?.installAttempts,
+    shutdownLog: () => readFileSync(path.join(userData, 'logs', 'startup.log'), 'utf8'),
+    prepareInstall: () => { assert.ok(installPreparation); return installPreparation(); },
+    dispose: () => rmSync(userData, { recursive: true, force: true }),
+  };
 }
 
-test('closing a pending desktop player aborts its lookup without creating a late view', async () => {
-  let signal: AbortSignal | undefined;
-  const harness = desktopHarness((_input, options) => new Promise((_resolve, reject) => {
-    signal = options?.signal as AbortSignal;
-    signal.addEventListener('abort', () => reject(signal!.reason), { once: true });
-  }));
-  const opening = harness.run("openPlayer('401872935')") as Promise<unknown>;
-  harness.run("closePlayer('401872935')");
-  await assert.rejects(opening, /Playback cancelled/);
-  assert.ok(signal?.aborted);
-  assert.equal(harness.views.length, 0);
-  assert.equal(harness.messages.length, 0);
+test('launching a second instance makes the existing hidden window visible', async () => {
+  const room = await desktop();
+  try {
+    room.window.hide();
+    room.app.emit('second-instance');
+    assert.equal(room.window.visible, true, 'relaunch must show the existing desktop window');
+    assert.equal(room.window.focused, true);
+  } finally { room.dispose(); }
 });
 
-test('late events from a replaced desktop player cannot fail its replacement', async () => {
-  const harness = desktopHarness(async () => Response.json({ players: [{ label: 'Primary', url: 'https://gooz.aapmains.net/new-stream-embed/123' }] }));
-  await harness.run("openPlayer('401872935')");
-  const old = harness.views[0].webContents;
-  await harness.run("openPlayer('401872935')");
-  old.emit('did-fail-load', {}, -2, 'Failed', '', true);
-  old.emit('render-process-gone');
-  old.emit('did-finish-load');
-  assert.equal(harness.messages.length, 0);
-  assert.equal(harness.run("players.get('401872935').failed"), false);
-  assert.equal(harness.views.length, 2);
+test('closing the desktop stops its services and exits', async () => {
+  const room = await desktop();
+  try {
+    room.window.close();
+    await settle();
+    assert.equal(room.hasExited(), true);
+    assert.equal(room.running.size, 0);
+  } finally { room.dispose(); }
 });
 
-test('one frozen frame on the final backup cannot restart an endless server cycle', async () => {
-  const harness=desktopHarness(async()=>Response.json({players:[{label:'Primary',url:'https://gooz.aapmains.net/new-stream-embed/123'},{label:'Backup',url:'https://gooz.aapmains.net/new-stream-embed/456'}]}));
-  await harness.run("openPlayer('401872935',1,1)");
-  harness.run("players.get('401872935').visible=true");
-  harness.views[0].webContents.media={ready:4,time:10,paused:false};
-  await harness.run("checkPlayer('401872935',players.get('401872935'))");
-  assert.equal(harness.run("players.get('401872935').attempt"),1);
-  harness.run("players.get('401872935').health.lastProgress=Date.now()-26000");
-  await harness.run("checkPlayer('401872935',players.get('401872935'))");
-  assert.equal(harness.run("players.get('401872935').failed"),true);
-  assert.equal(harness.views.length,1);
+test('closing the desktop still stops the server and exits when observer cleanup fails', async () => {
+  const room = await desktop({ stopFailures: ['observer'] });
+  try {
+    room.window.close();
+    await settle();
+    assert.equal(room.running.has('server'), false, 'observer failure must not leave the local server running');
+    assert.equal(room.running.has('streameast'), false, 'observer failure must not skip the remaining collector');
+    assert.equal(room.hasExited(), true, 'a failed cleanup must not retain a headless single-instance owner');
+  } finally { room.dispose(); }
 });
 
-test('a provider reload can report playing again after its new media starts',async()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[{label:'Primary',url:'https://gooz.aapmains.net/new-stream-embed/123'}]}));
-  await harness.run("openPlayer('401872935')");
-  harness.run("players.get('401872935').visible=true");
-  harness.views[0].webContents.media={ready:4,time:10,paused:false};
-  await harness.run("checkPlayer('401872935',players.get('401872935'))");
-  assert.equal((harness.messages.at(-1) as {state:string}).state,'playing');
-  harness.views[0].webContents.emit('did-finish-load');
-  assert.equal((harness.messages.at(-1) as {state:string}).state,'ready');
-  await harness.run("checkPlayer('401872935',players.get('401872935'))");
-  assert.equal((harness.messages.at(-1) as {state:string}).state,'playing');
+test('shutdown attempts every service and logs each failure before exiting', async () => {
+  const room = await desktop({ stopFailures: ['sportsurge', 'observer', 'streameast'] });
+  try {
+    room.window.close();
+    await settle();
+    assert.deepEqual(room.stopAttempts, ['admission', 'sportsurge', 'observer', 'streameast', 'server']);
+    assert.equal(room.running.has('server'), false);
+    assert.equal(room.hasExited(), true);
+    const log = room.shutdownLog();
+    for (const name of ['sportsurge', 'observer', 'streameast'])
+      assert.match(log, new RegExp(`${name} cleanup failed`));
+  } finally { room.dispose(); }
 });
 
-test('master controls do not resume failed or recovering hidden players',async()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[{label:'Primary',url:'https://gooz.aapmains.net/new-stream-embed/123'}]}));
-  await harness.run("openPlayer('401872935')");
-  harness.run("failPlayer('401872935',players.get('401872935'),'Unavailable')");
-  const scripts=harness.views[0].webContents.scripts;
-  assert.equal(scripts.at(-1),"document.querySelector('video')?.pause()");
-  const before=scripts.length;
-  await harness.run("applyControl('401872935',players.get('401872935'))");
-  assert.equal(scripts.length,before);
-  harness.run("players.get('401872935').failed=false;players.get('401872935').recovering=true");
-  await harness.run("applyControl('401872935',players.get('401872935'))");
-  assert.equal(scripts.length,before);
+test('repeated quit events share one cleanup while the observer is stopping', async () => {
+  let releaseObserver = () => {};
+  const observerStopGate = new Promise<void>(resolve => { releaseObserver = resolve; });
+  const room = await desktop({ observerStopGate });
+  try {
+    room.window.close();
+    await settle();
+    assert.deepEqual(room.stopAttempts, ['admission', 'sportsurge', 'observer']);
+    room.app.quit();
+    room.app.emit('window-all-closed');
+    assert.equal(room.hasExited(), false);
+    assert.deepEqual(room.stopAttempts, ['admission', 'sportsurge', 'observer']);
+    releaseObserver();
+    await settle();
+    assert.deepEqual(room.stopAttempts, ['admission', 'sportsurge', 'observer', 'streameast', 'server']);
+    assert.equal(room.hasExited(), true);
+  } finally { releaseObserver(); room.dispose(); }
 });
 
-test('statuses retain their originating request ID across replacements and automatic fallback',async()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[{label:'Primary',url:'https://gooz.aapmains.net/new-stream-embed/123'},{label:'Backup',url:'https://gooz.aapmains.net/new-stream-embed/456'}]}));
-  await harness.run("openPlayer('401872935',0,0,'first-request')");
-  harness.views[0].webContents.emit('did-finish-load');
-  const queuedOldStatus=harness.messages.at(-1) as {requestId:string};
-  await harness.run("openPlayer('401872935',1,0,'second-request')");
-  harness.views[1].webContents.emit('did-finish-load');
-  assert.equal(queuedOldStatus.requestId,'first-request');
-  assert.equal((harness.messages.at(-1) as {requestId:string}).requestId,'second-request');
-  await harness.run("recoverPlayer('401872935',players.get('401872935'))");
-  assert.equal(harness.run("players.get('401872935').requestId"),'second-request');
-  harness.views[2].webContents.emit('did-finish-load');
-  assert.equal((harness.messages.at(-1) as {requestId:string}).requestId,'second-request');
+test('explicit install preparation rejects cleanup failure and keeps the window open', async () => {
+  const room = await desktop({ stopFailures: ['observer'] });
+  try {
+    await assert.rejects(room.prepareInstall(), /observer cleanup failed/);
+    assert.deepEqual(room.stopAttempts, ['admission', 'sportsurge', 'observer', 'streameast', 'server']);
+    assert.equal(room.running.has('server'), false);
+    assert.equal(room.window.visible, true);
+    assert.equal(room.hasExited(), false);
+  } finally { room.dispose(); }
 });
 
-test('invalid playback request IDs are rejected before fetching',async()=>{
-  let lookups=0;
-  const harness=desktopHarness(async()=>{lookups+=1;return Response.json({players:[]});});
-  await assert.rejects(harness.run("openPlayer('401872935',0,0,123)"),/Invalid playback request/);
-  await assert.rejects(harness.run("openPlayer('401872935',0,0,'x'.repeat(101))"),/Invalid playback request/);
-  assert.equal(lookups,0);
+test('normal close permits an already downloaded update after cleanup succeeds', async () => {
+  const room = await desktop({ downloadedUpdate: true });
+  try {
+    room.window.close();
+    await settle();
+    assert.equal(room.running.size, 0);
+    assert.equal(room.hasExited(), true);
+    assert.equal(room.exitCode(), 0);
+    assert.equal(room.installAttempts(), 1);
+  } finally { room.dispose(); }
 });
 
-test('minimized and hidden windows do not spend a stream recovery budget',async()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[{label:'Primary',url:'https://gooz.aapmains.net/new-stream-embed/123'}]}));
-  await harness.run("openPlayer('401872935')");
-  harness.run("players.get('401872935').visible=true;players.get('401872935').health.lastProgress=Date.now()-60000");
-  harness.windowState.minimized=true;
-  await harness.run("checkPlayer('401872935',players.get('401872935'))");
-  assert.equal(harness.run("players.get('401872935').failed"),false);
-  assert.equal(harness.views[0].webContents.scripts.length,0);
-  harness.windowState.minimized=false;harness.windowState.visible=false;
-  harness.run("players.get('401872935').health.lastProgress=Date.now()-60000");
-  await harness.run("checkPlayer('401872935',players.get('401872935'))");
-  assert.equal(harness.run("players.get('401872935').failed"),false);
-  harness.windowState.visible=true;
-  harness.run("players.get('401872935').health.lastProgress=Date.now()-60000;resetPlaybackGrace()");
-  await harness.run("checkPlayer('401872935',players.get('401872935'))");
-  assert.equal(harness.run("players.get('401872935').failed"),false);
-  assert.equal(harness.views.length,1);
+test('failed cleanup exits with code 1 and does not install a downloaded update', async () => {
+  const room = await desktop({ downloadedUpdate: true, stopFailures: ['observer'] });
+  try {
+    room.window.close();
+    await settle();
+    assert.equal(room.running.has('server'), false);
+    assert.equal(room.hasExited(), true);
+    assert.equal(room.exitCode(), 1);
+    assert.equal(room.installAttempts(), 0);
+  } finally { room.dispose(); }
 });
 
-test('room audio selection releases the provider video mute and still honors master mute',async()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[{label:'Primary',url:'https://gooz.aapmains.net/new-stream-embed/123'}]}));
-  await harness.run("openPlayer('401872935')");
-  const video={muted:true,volume:1,play:async()=>{},pause:()=>{}};
-  const contents=harness.views[0].webContents;
-  contents.evaluate=script=>runInNewContext(script,{document:{querySelector:()=>video}});
-  harness.run("players.get('401872935').visible=true;control.audio='401872935'");
-  await harness.run("applyControl('401872935',players.get('401872935'))");
-  assert.equal(video.muted,false);
-  assert.equal(video.volume,0.7);
-  assert.equal(contents.audioMuted,false);
-  harness.run('control.muted=true');
-  await harness.run("applyControl('401872935',players.get('401872935'))");
-  assert.equal(contents.audioMuted,true);
-});
-
-test('pause reaches video elements created or replaced after the original control message',async()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[{label:'Primary',url:'https://gooz.aapmains.net/new-stream-embed/123'}]}));
-  await harness.run("openPlayer('401872935')");
-  const contents=harness.views[0].webContents;
-  let video:{volume:number;muted:boolean;paused:boolean;play:()=>Promise<void>;pause:()=>void}|null=null;
-  contents.evaluate=script=>runInNewContext(script,{document:{querySelector:()=>video}});
-  harness.run("control.playing=false;control.audio='401872935';players.get('401872935').visible=true");
-  await harness.run("applyControl('401872935',players.get('401872935'))");
-  assert.equal(contents.audioMuted,true);
-  harness.run('installIPC()');
-  harness.ipcMain.emit('room:layout',{sender:harness.hostContents,senderFrame:harness.hostContents.mainFrame},[{id:'401872935',x:0,y:0,width:640,height:360,hidden:false}]);
-  assert.equal(contents.audioMuted,true);
-  const autoplayVideo=()=>({volume:1,muted:false,paused:false,async play(){this.paused=false;},pause(){this.paused=true;}});
-  video=autoplayVideo();
-  await harness.run("checkPlayer('401872935',players.get('401872935'))");
-  assert.equal(video.paused,true);
-  assert.equal(video.volume,0.7);
-  video=autoplayVideo();
-  harness.run("players.get('401872935').visible=false");
-  await harness.run("checkPlayer('401872935',players.get('401872935'))");
-  assert.equal(video.paused,true);
-  assert.equal(harness.run("players.get('401872935').failed"),false);
-});
-
-test('Escape dismisses an open room overlay before normal fullscreen exit is allowed',()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[]}));
-  harness.run('installIPC()');
-  const event={sender:harness.hostContents,senderFrame:harness.hostContents.mainFrame};
-  const value={audio:'',muted:false,playing:true,volume:70,overlayOpen:true};
-  harness.ipcMain.emit('room:controls',event,value);
-  const press=(type:string,key:string)=>harness.run(`var prevented=0;handleRoomInput({preventDefault(){prevented++}},${JSON.stringify({type,key})});prevented`);
-  assert.equal(press('keyDown','Escape'),1);
-  assert.equal(harness.channels.at(-1),'room:overlay-escape');
-  const sent=harness.channels.length;
-  assert.equal(press('keyUp','Escape'),0);
-  assert.equal(press('keyDown','f'),0);
-  harness.ipcMain.emit('room:controls',event,{...value,overlayOpen:false});
-  assert.equal(press('keyDown','Escape'),0);
-  assert.equal(harness.channels.length,sent);
-  harness.ipcMain.emit('room:controls',event,value);
-  harness.hostContents.mainFrame.url='https://example.com/';
-  assert.equal(press('keyDown','Escape'),0);
-  assert.equal(harness.channels.length,sent);
-});
-
-test('room controls require a boolean overlay state from the trusted room',()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[]}));
-  harness.run('installIPC()');
-  const event={sender:harness.hostContents,senderFrame:harness.hostContents.mainFrame};
-  const value={audio:'',muted:false,playing:true,volume:70};
-  for(const overlayOpen of [undefined,'true',1,null]){
-    harness.ipcMain.emit('room:controls',event,{...value,overlayOpen});
-    assert.equal(harness.run('control.overlayOpen'),false);
+test('permanent local server startup failure shows an error and exits after cleanup', async () => {
+  const userData = mkdtempSync(path.join(tmpdir(), 'sunday-desktop-startup-'));
+  const events: string[] = [];
+  let exited = false;
+  let windows = 0;
+  const app = Object.assign(new EventEmitter(), {
+    isPackaged: true,
+    setName() {},
+    setAppUserModelId() {},
+    getPath: () => userData,
+    requestSingleInstanceLock: () => true,
+    whenReady: () => Promise.resolve(),
+    quit() {
+      let prevented = false;
+      app.emit('before-quit', { preventDefault() { prevented = true; } });
+      if (!prevented) { exited = true; events.push('exit'); }
+    },
+    exit() { exited = true; events.push('exit'); },
+  });
+  class Window {
+    constructor() { windows++; }
   }
-  harness.ipcMain.emit('room:controls',{sender:{},senderFrame:{}},{...value,overlayOpen:true});
-  assert.equal(harness.run('control.overlayOpen'),false);
-  harness.ipcMain.emit('room:controls',event,{...value,overlayOpen:true});
-  assert.equal(harness.run('control.overlayOpen'),true);
-});
-
-test('preload overlay Escape subscription removes its exact listener on cleanup',()=>{
-  const ipcRenderer=Object.assign(new EventEmitter(),{invoke:async()=>{},send:()=>{}});
-  let api: {onOverlayEscape:(callback:()=>void)=>()=>void} | undefined;
-  runInNewContext(readFileSync(new URL('../desktop/preload.cjs',import.meta.url),'utf8'),{
-    require:()=>({ipcRenderer,contextBridge:{exposeInMainWorld:(_name:string,value:typeof api)=>{api=value;}}}),
+  const observer = {
+    start: async () => 'http://127.0.0.1:49301',
+    stop() { events.push('observer stopped'); },
+  };
+  const server = {
+    start: async () => { throw new Error('server launch failed'); },
+    beginStop() { events.push('server admission stopped'); },
+    async stop() { events.push('server stopped'); },
+  };
+  const dependency = (name: string) => {
+    if (name === 'electron') return {
+      app, autoUpdater: new EventEmitter(), BrowserWindow: Window,
+      dialog: { showErrorBox(title: string, message: string) { events.push(`dialog: ${title}: ${message}`); } },
+      ipcMain: { handle() {} }, shell: { openExternal: async () => {} },
+      powerMonitor: new EventEmitter(), Notification: { isSupported: () => false },
+    };
+    if (name === './port.cjs') return { localServerPort: async () => 49300 };
+    if (name === './local-server.cjs') return { createLocalServer: () => server };
+    if (name === './sportsurge-observer.cjs') return { createSportsurgeObserver: () => observer };
+    if (name === './sportsurge-collector.cjs') return { createSportsurgeCollector: () => { throw new Error('collector started before server'); } };
+    if (name === './streameast-collector.cjs') return { createStreameastCollector: () => { throw new Error('collector started before server'); } };
+    if (name === './nsis-updater.cjs') return { DesktopNsisUpdater: class {} };
+    if (name === './update.cjs') return { CH: {}, createUpdateService() {}, selectUpdateFeedUrl() {} };
+    return require(name);
+  };
+  const source = readFileSync(path.resolve('desktop/main.cjs'), 'utf8');
+  const boot = runInNewContext(`(function(require, __dirname, process, fetch, AbortSignal, console) { ${source}\n})`, {
+    setImmediate, setTimeout, clearTimeout, setInterval, clearInterval, URL,
   });
-  let calls=0;
-  const unsubscribe=api!.onOverlayEscape(()=>{calls++;});
-  ipcRenderer.emit('room:overlay-escape',{});
-  assert.equal(calls,1);
-  unsubscribe();
-  ipcRenderer.emit('room:overlay-escape',{});
-  assert.equal(calls,1);
-  assert.equal(ipcRenderer.listenerCount('room:overlay-escape'),0);
-});
-
-test('native fullscreen IPC validates its sender and reports actual window state',()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[]}));
-  harness.run('installIPC()');
-  const event={sender:harness.hostContents,senderFrame:harness.hostContents.mainFrame};
-  assert.throws(()=>harness.invoke('room:set-fullscreen',event,'true'),/Invalid fullscreen request/);
-  assert.throws(()=>harness.invoke('room:set-fullscreen',{sender:{},senderFrame:{}},true),/Invalid fullscreen request/);
-  assert.equal(harness.windowState.fullscreen,false);
-  assert.equal(harness.invoke('room:set-fullscreen',event,true),true);
-  assert.equal(harness.windowState.fullscreen,true);
-  harness.run('notifyFullscreen(true)');
-  assert.equal(harness.channels.at(-1),'room:fullscreen-change');
-  assert.equal(harness.messages.at(-1),true);
-  assert.equal(harness.invoke('room:set-fullscreen',event,false),false);
-  harness.run('notifyFullscreen(false)');
-  assert.equal(harness.messages.at(-1),false);
-});
-
-test('native fullscreen transition notifications do not read a lagging window state',()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[]}));
-  // Windows may emit leave-full-screen while isFullScreen still reports true.
-  harness.windowState.fullscreen=true;
-  harness.run('notifyFullscreen(false)');
-  assert.equal(harness.messages.at(-1),false);
-  // Enter notifications likewise carry the event state, not the previous state.
-  harness.windowState.fullscreen=false;
-  harness.run('notifyFullscreen(true)');
-  assert.equal(harness.messages.at(-1),true);
-});
-
-test('native fullscreen Escape closes the overlay first, then the window fullscreen',()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[]}));
-  harness.windowState.fullscreen=true;
-  harness.run("control.overlayOpen=true;handleRoomInput({preventDefault(){}},{type:'keyDown',key:'Escape'})");
-  assert.equal(harness.windowState.fullscreen,true);
-  assert.equal(harness.channels.at(-1),'room:overlay-escape');
-  harness.run("control.overlayOpen=false;handleRoomInput({preventDefault(){}},{type:'keyDown',key:'Escape'})");
-  assert.equal(harness.windowState.fullscreen,false);
-});
-
-test('Escape exits native fullscreen when a current visible provider owns keyboard focus',async()=>{
-  const harness=desktopHarness(async()=>Response.json({players:[{label:'Primary',url:'https://gooz.aapmains.net/new-stream-embed/123'}]}));
-  await harness.run("openPlayer('401872935')");
-  const contents=harness.views[0].webContents;
-  harness.windowState.fullscreen=true;
-  let prevented=false;
-  const event={preventDefault(){prevented=true;}};
-  contents.emit('before-input-event',event,{type:'keyDown',key:'Escape'});
-  assert.equal(prevented,false);
-  assert.equal(harness.windowState.fullscreen,true);
-  harness.run("players.get('401872935').visible=true");
-  contents.emit('before-input-event',event,{type:'keyDown',key:'Escape'});
-  assert.equal(prevented,true);
-  assert.equal(harness.windowState.fullscreen,false);
-  await harness.run("openPlayer('401872935')");
-  harness.windowState.fullscreen=true;prevented=false;
-  contents.emit('before-input-event',event,{type:'keyDown',key:'Escape'});
-  assert.equal(prevented,false);
-  assert.equal(harness.windowState.fullscreen,true);
-});
-
-test('preload native fullscreen bridge forwards requests and cleans up state listeners',async()=>{
-  const requests:unknown[][]=[];
-  const ipcRenderer=Object.assign(new EventEmitter(),{invoke:async(...args:unknown[])=>{requests.push(args);return true;},send:()=>{}});
-  let api: {setFullscreen:(value:boolean)=>Promise<boolean>;onFullscreenChange:(callback:(value:boolean)=>void)=>()=>void} | undefined;
-  runInNewContext(readFileSync(new URL('../desktop/preload.cjs',import.meta.url),'utf8'),{
-    require:()=>({ipcRenderer,contextBridge:{exposeInMainWorld:(_name:string,value:typeof api)=>{api=value;}}}),
-  });
-  assert.equal(await api!.setFullscreen(true),true);
-  assert.deepEqual(requests,[['room:set-fullscreen',true]]);
-  const states:boolean[]=[];
-  const unsubscribe=api!.onFullscreenChange(value=>states.push(value));
-  ipcRenderer.emit('room:fullscreen-change',{},true);
-  ipcRenderer.emit('room:fullscreen-change',{},'bad');
-  ipcRenderer.emit('room:fullscreen-change',{},false);
-  unsubscribe();
-  ipcRenderer.emit('room:fullscreen-change',{},true);
-  assert.deepEqual(states,[true,false]);
-  assert.equal(ipcRenderer.listenerCount('room:fullscreen-change'),0);
+  try {
+    boot(dependency, path.resolve('desktop'), {
+      platform: 'win32', resourcesPath: userData, execPath: 'Sunday Room.exe', env: {},
+    }, async () => ({ ok: true }), AbortSignal, console);
+    for (let attempt = 0; attempt < 20 && !exited; attempt++) await settle();
+    assert.equal(exited, true, 'startup failure releases the single-instance owner');
+    assert.equal(windows, 0, 'a broken server never loads the room');
+    assert.deepEqual(events.filter(event => !event.startsWith('dialog: ')), [
+      'server admission stopped', 'observer stopped', 'server stopped', 'exit',
+    ]);
+    assert.equal(events.filter(event => event.startsWith('dialog: ')).length, 1);
+    assert.match(events.find(event => event.startsWith('dialog: ')) ?? '', /Sunday Room could not start.*server launch failed/i);
+  } finally { rmSync(userData, { recursive: true, force: true }); }
 });
