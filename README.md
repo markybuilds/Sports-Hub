@@ -300,7 +300,7 @@ Live provider verification decoded the Northwestern-Indiana game at 1280x720 in 
 
 ### Branch workflow
 
-Use `developer` for ongoing work and `main` for the published baseline. Keep changes focused, include relevant validation in commit or pull request notes, and update this README when playback behavior or setup changes.
+Use `main` for ongoing work via pull requests. Keep changes focused, include relevant validation in commit or pull request notes, and update this README when playback behavior or setup changes.
 
 ## Troubleshooting
 
