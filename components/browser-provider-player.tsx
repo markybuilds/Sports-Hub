@@ -1,0 +1,390 @@
+'use client';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AlertCircle, LoaderCircle, RefreshCw } from 'lucide-react';
+import { PlaybackSchema, type CandidateSummary, type Playback, type Session } from '@/lib/football/shared';
+import type { QualityPreference } from '@/lib/playback-quality';
+import type { Feed } from '@/lib/sunday';
+import { GamePlayer } from './game-player';
+import { ServerControls } from './server-controls';
+
+type Props = {
+  gameId: string;
+  initialCandidateId?: string;
+  availableCandidates?: CandidateSummary[];
+  manualFeed?: Feed;
+  graceEndsAt?: number;
+  focused: boolean;
+  audible: boolean;
+  volume: number;
+  defaultQuality: QualityPreference;
+  playing: boolean;
+  onPlayingChange: (playing: boolean) => void;
+  onAudibleChange: (audible: boolean) => void;
+  onVolumeChange: (volume: number) => void;
+};
+
+async function readError(response: Response): Promise<{ message: string; retryAfter?: number; code?: 'drain-exhausted' }> {
+  try {
+    const body: unknown = await response.json();
+    if (body && typeof body === 'object' && 'error' in body && typeof body.error === 'string') {
+      return {
+        message: body.error,
+        retryAfter: 'retryAfter' in body && typeof body.retryAfter === 'number' ? body.retryAfter : undefined,
+        code: 'code' in body && body.code === 'drain-exhausted' ? body.code : undefined,
+      };
+    }
+  }
+  catch {}
+  return { message: `Playback request failed (${response.status}).` };
+}
+
+class PlaybackRequestError extends Error {
+  constructor(message: string, readonly status: number, readonly retryAfter?: number, readonly code?: 'drain-exhausted') { super(message); }
+}
+
+function isTransientRequestError(error: unknown): boolean {
+  return !(error instanceof PlaybackRequestError) || error.status === 408 || error.status === 429 || error.status >= 500;
+}
+
+type SessionChange = { failure?: boolean; candidateId?: string; retry?: boolean;
+  origin?:{id:string;candidateId:string;generation:number} };
+type ReconcileIntent = { changes: SessionChange; priorId: string; kind: 'rejected' | 'uncertain' };
+function changePriority(change: SessionChange): number {
+  return change.candidateId ? 3 : change.retry ? 2 : change.failure ? 1 : 0;
+}
+
+function selectedCandidateMissing(value: Playback): boolean {
+  return !value.candidates.some(candidate => candidate.id === value.session.candidateId);
+}
+
+function missingSelectionKey(session: Session): string {
+  return JSON.stringify([session.id, session.candidateId]);
+}
+
+function retainCurrentFeed(next: Playback, previous: Playback | null): Playback {
+  if (!selectedCandidateMissing(next) || !previous || previous.session.id !== next.session.id ||
+    previous.session.candidateId !== next.session.candidateId || previous.session.generation !== next.session.generation) return next;
+  const selected = previous.candidates.find(candidate => candidate.id === next.session.candidateId);
+  return selected ? { ...next, candidates: [{ ...selected, availability: { kind: 'unknown' } }, ...next.candidates] } : next;
+}
+
+const missingServerMessage = 'This server is no longer listed. Choose another verified server or try again.';
+
+async function updateSession(session: Session, changes: SessionChange = {}): Promise<Playback> {
+  const response = await fetch('/api/playback', {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind: 'session', sessionId: session.id, generation: session.generation,
+      candidateId:changes.candidateId,failure:changes.failure??false,retry:changes.retry??false }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) { const failure = await readError(response); throw new PlaybackRequestError(failure.message, response.status, failure.retryAfter, failure.code); }
+  const parsed = PlaybackSchema.safeParse(await response.json());
+  if (!parsed.success) throw new Error('The player returned an invalid playback.');
+  return parsed.data;
+}
+
+export function BrowserProviderPlayer({ gameId, initialCandidateId, availableCandidates = [], manualFeed, graceEndsAt, focused, audible, volume, defaultQuality, playing, onPlayingChange, onAudibleChange, onVolumeChange }: Props) {
+  const [playback, setPlayback] = useState<Playback | null>(null);
+  const [message, setMessage] = useState('Finding your game…');
+  const [endedReason, setEndedReason] = useState<'final' | 'media' | null>(null);
+  const ended = endedReason !== null;
+  const [retry, setRetry] = useState(0);
+  const [requestedCandidateId, setRequestedCandidateId] = useState(initialCandidateId);
+  const [retryAfter, setRetryAfter] = useState<number | null>(null);
+  const [missingSelection, setMissingSelection] = useState<string | null>(null);
+  const sessionRef = useRef<Session | null>(null);
+  const ownedSession = useRef<Session | null>(null);
+  const inFlight = useRef(false);
+  const pendingChange = useRef<SessionChange | null>(null);
+  const reconcileIntent = useRef<ReconcileIntent | null>(null);
+  const changeRef = useRef<(changes: SessionChange) => Promise<void>>(async () => {});
+  const intent = useRef<{ key: string; requestId: string } | null>(null);
+  const rejectedInitialCandidate = useRef(false);
+  const ownedKey = useRef<string | null>(null);
+  const graceRef = useRef(graceEndsAt);
+  const fixedDeadline = useRef<number | null>(graceEndsAt ?? null);
+  const openFailures = useRef(0);
+  const transportFailures = useRef(0);
+  const commandSerial = useRef(0);
+  const openTimer = useRef<number | null>(null);
+  const commandTimer = useRef<number | null>(null);
+  const repairAttemptedFor = useRef<string | null>(null);
+  useEffect(() => { graceRef.current = graceEndsAt; if (graceEndsAt !== undefined) fixedDeadline.current = graceEndsAt; }, [graceEndsAt]);
+  const endingDeadline = useCallback(() => fixedDeadline.current ?? graceRef.current ?? ownedSession.current?.graceEndsAt ?? null, []);
+
+  const reopen = useCallback((reason = 'Reconnecting to your game…') => {
+    const deadline = endingDeadline();
+    if (deadline !== null && (deadline <= Date.now() || !ownedSession.current)) {
+      setEndedReason(deadline <= Date.now() ? 'final' : 'media');
+      return;
+    }
+    const pending = pendingChange.current;
+    if (pending && (pending.candidateId || pending.retry) && (!reconcileIntent.current || changePriority(pending) >= changePriority(reconcileIntent.current.changes))) {
+      reconcileIntent.current = { changes: pending, priorId: sessionRef.current?.id || '', kind: 'rejected' };
+    }
+    sessionRef.current = null;
+    pendingChange.current = null;
+    commandSerial.current++;
+    if (commandTimer.current !== null) { window.clearTimeout(commandTimer.current); commandTimer.current = null; }
+    setPlayback(null);
+    setMissingSelection(null);
+    setRetryAfter(null);
+    setMessage(reason);
+    if (openTimer.current !== null) window.clearTimeout(openTimer.current);
+    const delays = [1000, 2000, 5000, 10000, 30000, 60000];
+    const delay = delays[Math.min(openFailures.current++, delays.length - 1)];
+    openTimer.current = window.setTimeout(() => { openTimer.current = null; setRetry(value => value + 1); }, delay);
+  }, [endingDeadline]);
+
+  useEffect(() => {
+    const key = `${gameId}:${!!manualFeed}`;
+    ownedKey.current = key;
+    fixedDeadline.current = graceRef.current ?? null;
+    openFailures.current = 0;
+    transportFailures.current = 0;
+    return () => {
+      ownedKey.current = null;
+      reconcileIntent.current = null;
+      if (openTimer.current !== null) window.clearTimeout(openTimer.current);
+      if (commandTimer.current !== null) window.clearTimeout(commandTimer.current);
+      const session = ownedSession.current;
+      sessionRef.current = null;
+      ownedSession.current = null;
+      if (session?.gameId === gameId) void fetch(`/api/playback?session=${encodeURIComponent(session.id)}`, { method: 'DELETE', keepalive: true });
+    };
+  }, [gameId, manualFeed]);
+
+  useEffect(() => {
+    let active = true;
+    const key = `${gameId}:${!!manualFeed}`;
+    if (intent.current?.key !== key) intent.current = { key, requestId: crypto.randomUUID() };
+    const requestId = intent.current.requestId;
+    inFlight.current = false;
+    pendingChange.current = null;
+    const body = JSON.stringify({ kind: 'open', gameId, manual: !!manualFeed, requestId,
+      ...(!manualFeed && requestedCandidateId ? { initialCandidateId: requestedCandidateId } : {}) });
+    const open = window.setTimeout(() => {
+      const deadline = endingDeadline();
+      if (deadline !== null && (deadline <= Date.now() || !ownedSession.current)) { setEndedReason(deadline <= Date.now() ? 'final' : 'media'); return; }
+      setEndedReason(null);
+      if (!openFailures.current) setMessage('Finding your game…');
+      setPlayback(null);
+      setRetryAfter(null);
+      void fetch('/api/playback', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal: AbortSignal.timeout(15000) }).then(async response => {
+      if (!response.ok) { const failure = await readError(response); throw new PlaybackRequestError(failure.message,response.status); }
+      const parsed = PlaybackSchema.safeParse(await response.json());
+      if (!parsed.success) throw new Error('The player returned an invalid playback.');
+      if (!manualFeed && !parsed.data.candidates.length) {
+        void fetch(`/api/playback?session=${encodeURIComponent(parsed.data.session.id)}`, { method: 'DELETE', keepalive: true });
+        throw new Error('No player is listed for this game.');
+      }
+      if (!active) {
+        if (ownedKey.current !== key) void fetch(`/api/playback?session=${encodeURIComponent(parsed.data.session.id)}`, { method: 'DELETE', keepalive: true });
+        return;
+      }
+      const deadline = endingDeadline();
+      if (deadline !== null && deadline <= Date.now()) {
+        void fetch(`/api/playback?session=${encodeURIComponent(parsed.data.session.id)}`, { method: 'DELETE', keepalive: true });
+        setEndedReason('final');
+        return;
+      }
+      openFailures.current = 0;
+      transportFailures.current = 0;
+      if (ownedSession.current && ownedSession.current.id !== parsed.data.session.id) void fetch(`/api/playback?session=${encodeURIComponent(ownedSession.current.id)}`, { method: 'DELETE', keepalive: true });
+      sessionRef.current = parsed.data.session;
+      ownedSession.current = parsed.data.session;
+      if (parsed.data.session.graceEndsAt !== null) fixedDeadline.current = parsed.data.session.graceEndsAt;
+      const missing = !manualFeed && selectedCandidateMissing(parsed.data);
+      setMissingSelection(missing ? missingSelectionKey(parsed.data.session) : null);
+      setMessage(missing ? missingServerMessage : '');
+      setPlayback(parsed.data);
+      const replay = reconcileIntent.current;
+      reconcileIntent.current = null;
+      if (replay?.changes.candidateId && parsed.data.candidates.some(candidate => candidate.id === replay.changes.candidateId) && replay.changes.candidateId !== parsed.data.session.candidateId) {
+        void changeRef.current(replay.changes);
+      } else if (replay?.priorId === parsed.data.session.id && replay.kind === 'rejected') {
+        if (replay.changes.retry) void changeRef.current(replay.changes);
+      }
+    }).catch(error => {
+      if (!active) return;
+      const deadline = endingDeadline();
+      if (deadline !== null && (deadline <= Date.now() || !ownedSession.current || error instanceof PlaybackRequestError && (error.status === 409 || error.status === 410))) {
+        setEndedReason(deadline <= Date.now() ? 'final' : 'media');
+        return;
+      }
+      if (error instanceof PlaybackRequestError && error.status === 404 && requestedCandidateId) {
+        rejectedInitialCandidate.current = true;
+        setMessage(error.message);
+        setPlayback(null);
+        return;
+      }
+      reopen(error instanceof PlaybackRequestError && error.status === 404 ? error.message : undefined);
+    }); }, 0);
+    return () => {
+      active = false;
+      window.clearTimeout(open);
+    };
+  }, [gameId, requestedCandidateId, manualFeed, retry, reopen, endingDeadline]);
+
+  useEffect(() => {
+    if (!playback || ended) return;
+    const timer = window.setInterval(() => { if (sessionRef.current && !inFlight.current) void changeRef.current({}); }, 30000);
+    return () => window.clearInterval(timer);
+  }, [playback, ended]);
+
+  useEffect(() => {
+    const deadline = graceEndsAt ?? playback?.session.graceEndsAt ?? fixedDeadline.current ?? ownedSession.current?.graceEndsAt;
+    if (deadline === undefined || deadline === null) return;
+    const timer = window.setTimeout(() => setEndedReason('final'), Math.max(0, deadline - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [graceEndsAt, playback]);
+
+  useEffect(() => {
+    if (!ended) return;
+    const session = ownedSession.current;
+    if (!session) return;
+    sessionRef.current = null;
+    ownedSession.current = null;
+    void fetch(`/api/playback?session=${encodeURIComponent(session.id)}`, { method: 'DELETE', keepalive: true });
+  }, [ended]);
+
+  const change = useCallback(async (changes: SessionChange) => {
+    const session = sessionRef.current;
+    if(changes.origin&&(!session||session.id!==changes.origin.id||session.candidateId!==changes.origin.candidateId||
+      session.generation!==changes.origin.generation))return;
+    if (!session) {
+      if (changes.candidateId || changes.retry) {
+        if (!reconcileIntent.current || changePriority(changes) >= changePriority(reconcileIntent.current.changes)) reconcileIntent.current = { changes, priorId: '', kind: 'rejected' };
+        if (openTimer.current !== null) { window.clearTimeout(openTimer.current); openTimer.current = null; }
+        setRetry(value => value + 1);
+      }
+      return;
+    }
+    if (inFlight.current) {
+      if (!pendingChange.current || changePriority(changes) >= changePriority(pendingChange.current)) pendingChange.current = changes;
+      return;
+    }
+    if (commandTimer.current !== null) { window.clearTimeout(commandTimer.current); commandTimer.current = null; }
+    inFlight.current = true;
+    const serial = ++commandSerial.current;
+    try {
+      const next = await updateSession(session, changes);
+      if (sessionRef.current?.id !== session.id || next.session.generation < sessionRef.current.generation) return;
+      transportFailures.current = 0;
+      sessionRef.current = next.session;
+      ownedSession.current = next.session;
+      if (next.session.graceEndsAt !== null) fixedDeadline.current = next.session.graceEndsAt;
+      if (next.session.state === 'closed') setEndedReason('final');
+      else {
+        const missing = !manualFeed && selectedCandidateMissing(next);
+        setMissingSelection(missing ? missingSelectionKey(next.session) : null);
+        setMessage(missing ? missingServerMessage : '');
+        setRetryAfter(null);
+        setPlayback(previous => retainCurrentFeed(next, previous));
+      }
+    } catch (error) {
+      if (sessionRef.current?.id === session.id) {
+        if (error instanceof PlaybackRequestError && (error.status === 410 || error.status === 409)) {
+          const deadline = endingDeadline();
+          if (error.status === 410 && deadline !== null) setEndedReason(deadline <= Date.now() ? 'final' : 'media');
+          else {
+            if (changes.candidateId || changes.retry) reconcileIntent.current = { changes, priorId: session.id, kind: 'rejected' };
+            reopen();
+          }
+        }
+        else if (error instanceof PlaybackRequestError && error.code === 'drain-exhausted') {
+          setEndedReason('media');
+        } else if (error instanceof PlaybackRequestError && error.status === 503 && error.retryAfter !== undefined) {
+          setMessage(error.message);
+          setRetryAfter(error.retryAfter);
+        } else {
+          if (isTransientRequestError(error)) {
+            const pending = pendingChange.current;
+            if (changePriority(changes) === 0) {
+              if (!pending) {
+                const delays = [1000, 2000, 5000, 10000, 30000, 60000];
+                const delay = delays[Math.min(transportFailures.current++, delays.length - 1)];
+                commandTimer.current = window.setTimeout(() => {
+                  commandTimer.current = null;
+                  if (sessionRef.current?.id === session.id) void changeRef.current({});
+                }, delay);
+              }
+            } else {
+              if (!pending || changePriority(pending) <= changePriority(changes)) reconcileIntent.current = { changes, priorId: session.id, kind: 'uncertain' };
+              openFailures.current = Math.max(openFailures.current, transportFailures.current++);
+              reopen();
+            }
+          } else {
+            setMessage(error instanceof Error ? error.message : 'Player unavailable.');
+          }
+        }
+      }
+    } finally {
+      if (serial !== commandSerial.current) return;
+      inFlight.current = false;
+      const pending = pendingChange.current;
+      pendingChange.current = null;
+      if (pending && sessionRef.current?.id === session.id) void changeRef.current(pending);
+    }
+  }, [reopen, endingDeadline, manualFeed]);
+  useEffect(() => { changeRef.current = change; }, [change]);
+
+  useEffect(() => {
+    if (!missingSelection || ended || manualFeed) {
+      if (!missingSelection) repairAttemptedFor.current = null;
+      return;
+    }
+    if (repairAttemptedFor.current === missingSelection) return;
+    repairAttemptedFor.current = missingSelection;
+    void changeRef.current({});
+  }, [missingSelection, ended, manualFeed]);
+
+  useEffect(() => {
+    if (retryAfter === null || ended || !playback) return;
+    const timer = window.setTimeout(() => void change({}), Math.max(0, retryAfter - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [retryAfter, ended, playback, change]);
+
+  const session = playback?.session;
+  const candidate = playback?.candidates.find(item => item.id === session?.candidateId);
+  const feed = playback && manualFeed ? manualFeed : (session && candidate ? {
+    url: `/api/stream/${encodeURIComponent(gameId)}/index.m3u8?session=${encodeURIComponent(session.id)}&candidate=${encodeURIComponent(candidate.id)}&generation=${session.generation}`,
+    label: candidate.label,
+  } : null);
+  const currentFeed=(url:string)=>{
+    if(url!==feed?.url)return false;
+    if(manualFeed)return true;
+    const current=sessionRef.current;
+    return !!session&&!!candidate&&current?.id===session.id&&current.candidateId===candidate.id&&current.generation===session.generation;
+  };
+  const mediaChange=(url:string,changes:SessionChange)=>{
+    if(!currentFeed(url)||!session||!candidate)return;
+    void change({...changes,origin:{id:session.id,candidateId:candidate.id,generation:session.generation}});
+  };
+  const mediaDecoded=(url:string,startupMs:number)=>{
+    if(manualFeed||!currentFeed(url)||!session||!candidate||session.state!=='active')return;
+    void fetch('/api/playback',{
+      method:'PATCH',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind:'playback-evidence',sessionId:session.id,candidateId:candidate.id,
+        generation:session.generation,evidence:{kind:'decoded',startupMs}}),
+      signal:AbortSignal.timeout(10000),
+    }).catch(()=>{});
+  };
+
+  return <div className="provider-player">
+    <div className="provider-surface">
+      {ended ? <div className="player-message"><AlertCircle/><strong>{endedReason === 'final' ? 'Game stream ended' : 'Video ended'}</strong><p>{endedReason === 'final' ? 'Playback ended after the game became final.' : 'This video reached its end.'}</p></div>
+        : feed ? <GamePlayer feed={feed} focused={focused} audible={audible} volume={volume} defaultQuality={defaultQuality} playing={playing} startupTimeoutMs={candidate?.sourceIds.includes('sportsurge-v2') ? 75000 : undefined} onPlayingChange={onPlayingChange} onAudibleChange={onAudibleChange} onVolumeChange={onVolumeChange} onDecoded={manualFeed?undefined:mediaDecoded} onFatal={manualFeed ? undefined : url => mediaChange(url,{failure:true})} onEnded={url => { if(!currentFeed(url))return; if (!manualFeed && session?.state === 'active') mediaChange(url,{failure:true}); else setEndedReason('media'); }} onRetry={manualFeed ? undefined : url => mediaChange(url,{retry:true})} errorHint={message || 'This server is unavailable. Try again or switch to another listed server.'}/>
+        : <div className="player-message">{message === 'Finding your game…' || message === 'Reconnecting to your game…' ? <LoaderCircle className="spin"/> : <AlertCircle/>}<strong>{message === 'Finding your game…' ? 'Opening the live player' : message === 'Reconnecting to your game…' ? 'Reconnecting' : 'Player unavailable'}</strong><p>{message}</p>{message !== 'Finding your game…' && <button className="button" onClick={() => { if (openTimer.current !== null) { window.clearTimeout(openTimer.current); openTimer.current = null; } if (rejectedInitialCandidate.current) { rejectedInitialCandidate.current = false; reconcileIntent.current = null; setRequestedCandidateId(undefined); } setRetry(value => value + 1); }}><RefreshCw size={14}/>Try again</button>}</div>}
+    </div>
+    {!manualFeed && <ServerControls candidates={playback?.candidates ?? availableCandidates} selectedCandidateId={session?.candidateId ?? requestedCandidateId ?? ''} disabled={ended}
+      onSelect={candidateId => { if (!sessionRef.current) { rejectedInitialCandidate.current = false; setRequestedCandidateId(candidateId); } void change({ candidateId }); }} onSwitch={() => {
+        if (!playback?.candidates.length || !session) return;
+        const playable = playback.candidates.filter(item => item.availability.kind === 'playable');
+        const index = playable.findIndex(item => item.id === session.candidateId);
+        const next = playable[(index + 1) % playable.length];
+        if (next && next.id !== session.candidateId) void change({ candidateId: next.id });
+      }}/>}
+  </div>;
+}

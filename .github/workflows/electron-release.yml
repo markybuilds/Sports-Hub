@@ -1,0 +1,99 @@
+name: Electron release
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    env:
+      # A code-signing certificate, when one exists. Absent today; see
+      # docs/desktop-updates.md. Partially configured is an error, and configured but
+      # unsigned output is an error, so signing cannot quietly stop working.
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Check release version
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME must match package version v$version"
+          }
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm run desktop:icons:check
+      - run: npm run desktop:branding
+      - run: npm run desktop:package
+      - run: node --experimental-strip-types --test tests/updater-feed.test.ts
+        env:
+          SUNDAY_ROOM_RELEASE_DIR: dist-electron
+      - name: Report the signing state of the installer
+        shell: pwsh
+        run: |
+          $configured = [bool]$env:CSC_LINK
+          if ($configured -ne [bool]$env:CSC_KEY_PASSWORD) {
+            throw 'CSC_LINK and CSC_KEY_PASSWORD must be set together. Neither is expected today; both are needed to sign.'
+          }
+          $installer = Get-ChildItem dist-electron -Filter '*-Setup-x64.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'No installer was produced.' }
+          $status = (Get-AuthenticodeSignature $installer.FullName).Status
+          $summary = "| artifact | signature |`n| --- | --- |`n| $($installer.Name) | $status |"
+          Add-Content $env:GITHUB_STEP_SUMMARY $summary
+          if ($configured -and $status -ne 'Valid') {
+            throw "A certificate is configured but the installer is '$status'. Refusing to publish it unsigned."
+          }
+          if (-not $configured) {
+            Write-Warning "UNSIGNED. The installer is not signed, so Windows will warn and the updater cannot verify it. See docs/desktop-updates.md."
+          }
+      - run: node tests/installer-path.mjs
+      - run: node tests/installer-instdir.mjs
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/installer-shortcuts.ps1
+      - run: npm run desktop:smoke:packaged
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sunday-room-windows-installer
+          # The installer and `latest.yml` are both needed for installed copies to update.
+          path: |
+            dist-electron/Sunday-Room-*-Setup-x64.exe
+            dist-electron/latest.yml
+          if-no-files-found: error
+
+  prepare-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: sunday-room-windows-installer
+          path: installer
+      # `latest.yml` names the installer electron-updater downloads. Both assets must be
+      # attached to the release for installed copies to update.
+      - name: Create or update release installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" installer/*.exe installer/latest.yml --clobber
+          else
+            gh release create "$TAG_NAME" installer/*.exe installer/latest.yml --draft --verify-tag --title "Sunday Room ${TAG_NAME#v}"
+          fi
